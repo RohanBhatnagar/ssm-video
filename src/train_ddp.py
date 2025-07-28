@@ -8,7 +8,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, Dataset
 from torchvision import transforms
 from tqdm import tqdm
-from model.model import VideoFramePredictor
+from model import VideoFramePredictor
+from dataset import MovingMNIST
 
 def train(rank, world_size, args):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -17,7 +18,22 @@ def train(rank, world_size, args):
     model = VideoFramePredictor().to(rank)
     model = DDP(model, device_ids=[rank])
 
-    dataset = DummyVideoDataset()
+    # Choose dataset type
+    if args['use_precomputed']:
+        try:
+            from precompute_dataset import PrecomputedMovingMNIST
+            dataset = PrecomputedMovingMNIST()
+            if rank == 0:
+                print("Using precomputed dataset")
+        except:
+            if rank == 0:
+                print("Precomputed dataset not found, falling back to on-the-fly generation")
+            dataset = MovingMNIST()
+    else:
+        dataset = MovingMNIST()
+        if rank == 0:
+            print("Using on-the-fly dataset generation")
+    
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
     dataloader = DataLoader(dataset, batch_size=args['batch_size'], sampler=sampler, num_workers=4, pin_memory=True)
 
@@ -55,6 +71,7 @@ def main():
         "batch_size": 32,
         "lr": 2e-4,
         "epochs": 10,
+        "use_precomputed": False,  # Set to True for faster training
     }
     mp.spawn(train, args=(world_size, args), nprocs=world_size)
 
