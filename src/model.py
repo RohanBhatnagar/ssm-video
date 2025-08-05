@@ -26,10 +26,10 @@ class VideoFramePredictor(nn.Module):
         self.decoder = Decoder(latent_dim=latent_dim, 
                                output_channels=out_channels)
 
-    def forward(self, frames):  # [B, T, 3, 64, 64]
-        x = self.encoder(frames)         # [B, T, 16384]
-        x = self.temporal(x)             # [B, 16384]  ← latent of next frame
-        out = self.decoder(x)            # [B, 3, 64, 64]
+    def forward(self, frames): # [B, T, 3, 64, 64]
+        x = self.encoder(frames) # [B, T, 16384]
+        x = self.temporal(x) # [B, 16384] 
+        out = self.decoder(x) # [B, 3, 64, 64]
         return out
 
 # resnet block for encoder
@@ -57,28 +57,6 @@ class ResidualBlock(nn.Module):
         out += identity
         out = F.relu(out)
         return out
-
-# upres block for decoder 
-class UpResBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
-        self.gn1 = nn.GroupNorm(8, out_ch)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
-        self.gn2 = nn.GroupNorm(8, out_ch)
-        self.res = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(in_ch, out_ch, 1, bias=False),
-            nn.GroupNorm(8, out_ch)
-        )
-
-    def forward(self, x):
-        r = self.res(x)
-        x = self.upsample(x)
-        x = F.relu(self.gn1(self.conv1(x)))
-        x = self.gn2(self.conv2(x))
-        return F.relu(x + r)
     
 # resnet style encoder
 class Encoder(nn.Module):
@@ -114,44 +92,12 @@ class Encoder(nn.Module):
     def forward(self, frames):  # [B, T, 3, 64, 64]
         B, T, C, H, W = frames.shape
         x = frames.view(B * T, C, H, W)
-        x = self.stem(x)        # [B*T, base_channels, 16, 16]
-        x = self.backbone(x)    # [B*T, channels, 4, 4]
-        x = x.view(B, T, -1)    # [B, T, final_dim]
+        x = self.stem(x) # [B*T, base_channels, 16, 16]
+        x = self.backbone(x) # [B*T, channels, 4, 4]
+        x = x.view(B, T, -1) # [B, T, final_dim]
         return x
     
-
-class MambaBlock(nn.Module):
-    def __init__(self, d_model, dt_rank=1):
-        super().__init__()
-        self.d_model = d_model
-        self.dt_rank = dt_rank
-
-        # Input projections
-        self.in_proj = nn.Linear(d_model, 2 * d_model)  # u, Δ
-
-        # State-space params
-        self.A = nn.Parameter(torch.randn(d_model))  # state decay
-        self.B = nn.Parameter(torch.randn(d_model))  # input influence
-
-        # Output projection
-        self.out_proj = nn.Linear(d_model, d_model)
-
-    def forward(self, x):  # x: [B, T, D]
-        B, T, D = x.size()
-
-        u, delta = self.in_proj(x).chunk(2, dim=-1)  # [B, T, D] each
-        delta = torch.sigmoid(delta)  # gating input
-
-        h = torch.zeros(B, D, device=x.device)  # initial state
-        y = []
-
-        for t in range(T):
-            h = torch.exp(-self.A * delta[:, t]) * h + self.B * u[:, t]
-            y.append(h)
-
-        y = torch.stack(y, dim=1)  # [B, T, D]
-        return self.out_proj(y)
-    
+# https://github.com/state-spaces/mamba
 class TemporalMamba(nn.Module):
     def __init__(self, input_dim=16384, hidden_dim=512, depth=4):
         super().__init__()
@@ -168,11 +114,11 @@ class TemporalMamba(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, input_dim)
 
-    def forward(self, x):  # x: [B, T, input_dim]
-        x = self.in_proj(x)        # [B, T, hidden_dim]
-        x = self.mamba_layers(x)   # [B, T, hidden_dim]
-        x = self.norm(x[:, -1])    # take last time step
-        return self.out_proj(x)    # [B, input_dim]
+    def forward(self, x): # x: [B, T, input_dim]
+        x = self.in_proj(x) # [B, T, hidden_dim]
+        x = self.mamba_layers(x)# [B, T, hidden_dim]
+        x = self.norm(x[:, -1]) # take last time step
+        return self.out_proj(x) # [B, input_dim]
     
     
 class Decoder(nn.Module):
