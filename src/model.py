@@ -1,6 +1,6 @@
 import torch.nn as nn 
 import torch.nn.functional as F
-from mamba import Mamba
+from mamba_ssm import Mamba
 from ptflops import get_model_complexity_info
 
 class VideoFramePredictor(nn.Module):
@@ -9,7 +9,7 @@ class VideoFramePredictor(nn.Module):
                  base_channels=64, 
                  encoder_blocks=[2, 2, 2, 2], 
                  latent_dim=16384,
-                 ssm_hidden_dim=512,
+                 ssm_hidden_dim=1024,
                  ssm_depth=4,
                  out_channels=3):
         super().__init__()
@@ -22,6 +22,7 @@ class VideoFramePredictor(nn.Module):
                                       hidden_dim=ssm_hidden_dim, 
                                       depth=ssm_depth)
         
+        
         self.decoder = Decoder(latent_dim=latent_dim, 
                                output_channels=out_channels)
 
@@ -30,20 +31,6 @@ class VideoFramePredictor(nn.Module):
         x = self.temporal(x)             # [B, 16384]  ← latent of next frame
         out = self.decoder(x)            # [B, 3, 64, 64]
         return out
-    
-    def get_model_complexity(self):
-        """Get detailed model complexity using ptflops"""
-        macs, params = get_model_complexity_info(
-            self, 
-            (3584,), 
-            as_strings=True, 
-            print_per_layer_stat=False,
-            verbose=False
-        )
-        return macs, params
-
-    
-
 
 # resnet block for encoder
 class ResidualBlock(nn.Module):
@@ -70,25 +57,55 @@ class ResidualBlock(nn.Module):
         out += identity
         out = F.relu(out)
         return out
+
+# upres block for decoder 
+class UpResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
+        self.gn1 = nn.GroupNorm(8, out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.gn2 = nn.GroupNorm(8, out_ch)
+        self.res = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            nn.GroupNorm(8, out_ch)
+        )
+
+    def forward(self, x):
+        r = self.res(x)
+        x = self.upsample(x)
+        x = F.relu(self.gn1(self.conv1(x)))
+        x = self.gn2(self.conv2(x))
+        return F.relu(x + r)
     
 # resnet style encoder
 class Encoder(nn.Module):
-    def __init__(self, in_channels=3, base_channels=64, num_blocks=[2, 2, 2, 2]):
+    def __init__(self, in_channels=3, base_channels=64, num_blocks=[2,2,2,2]):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, base_channels, 7, stride=2, padding=3, bias=False),  # 32x32
+            nn.Conv2d(in_channels, base_channels, 7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(base_channels),
             nn.ReLU(),
-            nn.MaxPool2d(3, stride=2, padding=1)  # 16x16
+            nn.MaxPool2d(3, stride=2, padding=1),
         )
-
+        
         layers = []
         channels = base_channels
+        total_stages = len(num_blocks)
         for i, n_blocks in enumerate(num_blocks):
-            stride = 1 if i == 0 else 2
-            blocks = [ResidualBlock(channels, channels * 2, stride=stride, downsample=True)]
+            if i == 0:
+                stride = 1
+            elif i == total_stages - 1:
+                stride = 1        
+            else:
+                stride = 2
+
+            blocks = [ResidualBlock(channels, channels*2, stride=stride, downsample=True)]
             channels *= 2
-            blocks += [ResidualBlock(channels, channels) for _ in range(n_blocks - 1)]
+            for _ in range(n_blocks - 1):
+                blocks.append(ResidualBlock(channels, channels))
             layers.append(nn.Sequential(*blocks))
 
         self.backbone = nn.Sequential(*layers)
@@ -140,7 +157,12 @@ class TemporalMamba(nn.Module):
         super().__init__()
         self.in_proj = nn.Linear(input_dim, hidden_dim)
         self.mamba_layers = nn.Sequential(*[
-            Mamba(d_model=hidden_dim, d_state=16, expand=2, conv_kernel=3)
+            Mamba(
+                d_model=hidden_dim, 
+                d_state=16, 
+                d_conv=4, 
+                expand=2
+            )
             for _ in range(depth)
         ])
         self.norm = nn.LayerNorm(hidden_dim)

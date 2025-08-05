@@ -12,25 +12,22 @@ import modal
 # Modal App setup
 app = modal.App("video-frame-prediction-ddp")
 
-# Create Modal image with all dependencies
 image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install([
-        "torch==2.7.1",
-        "torchvision==0.22.1",
-        "tqdm==4.67.1", 
-        "numpy==2.2.6",
-        "matplotlib==3.10.3",
-        "pillow==11.3.0",
-        "ptflops==0.7.4",
-        "mamba-ssm",
-    ])
-    .run_commands("mkdir -p /tmp/data")
-)
-
-mount = modal.Mount.from_local_dir(
-    local_path="/Users/rohanbhatnagar/ssm-video/src",
-    remote_path="/app/src"
+    modal.Image
+         .from_registry("pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel")
+         .pip_install([
+             "torch==2.7.1",
+             "torchvision==0.22.1",
+             "tqdm==4.67.1",
+             "numpy==2.2.6",
+             "matplotlib==3.10.3",
+             "pillow==11.3.0",
+             "ptflops==0.7.4",
+             "mamba-ssm",
+             "ptflops",
+         ])
+         .run_commands("mkdir -p /tmp/data")
+         .add_local_file("model.py", remote_path="/app/model.py")
 )
 
 volume = modal.Volume.from_name("moving-mnist-data", create_if_missing=True)
@@ -38,11 +35,68 @@ volume = modal.Volume.from_name("moving-mnist-data", create_if_missing=True)
 @app.function(
     image=image,
     volumes={"/data": volume},
-    gpu="H100",
-    mounts=[mount],
+    gpu="A100",
     timeout=7200,
-    cpu=8.0,
-    memory=32768,  # 32GB RAM
+)
+def examine_model():  
+    # in cuda env   
+    import sys
+    sys.path.append("/app")
+    from model import VideoFramePredictor, Encoder, TemporalMamba, Decoder
+    from ptflops import get_model_complexity_info
+    
+    with torch.cuda.device(0):
+        encoder = Encoder().cuda()
+        encoder_macs, encoder_params = get_model_complexity_info(
+            encoder,
+            (7, 3, 64, 64),  # 7 frames 3 channels 64x64
+            as_strings=True,
+            print_per_layer_stat=False,
+            verbose=False,
+        )
+        print(f"Encoder FLOPS: {encoder_macs}")
+        print(f"Encoder Params: {encoder_params}")
+        
+        temporal = TemporalMamba(input_dim=16384, hidden_dim=1024, depth=4).cuda()
+        mamba_macs, mamba_params = get_model_complexity_info(
+            temporal,
+            (7, 16384),  # 7 timesteps 16384 latent dimension
+            as_strings=True,
+            print_per_layer_stat=False,
+            verbose=False,
+        )
+        print(f"Mamba FLOPS: {mamba_macs}")
+        print(f"Mamba Params: {mamba_params}")
+        
+        decoder = Decoder(latent_dim=16384, output_channels=3).cuda()
+        decoder_macs, decoder_params = get_model_complexity_info(
+            decoder,
+            (16384,),  # single flattened latent vector
+            as_strings=True,
+            print_per_layer_stat=False,
+            verbose=False,
+        )
+        print(f"Decoder FLOPS: {decoder_macs}")
+        print(f"Decoder Params: {decoder_params}")
+        
+        model = VideoFramePredictor().cuda()
+        total_macs, total_params = get_model_complexity_info(
+            model,
+            (7, 3, 64, 64),  # 7 frames, 3 channels, 64x64
+            as_strings=True,
+            print_per_layer_stat=False,
+            verbose=False,
+        )
+        print(f"Total FLOPS: {total_macs}")
+        print(f"Total Params: {total_params}")
+        
+@app.function(
+    image=image,
+    volumes={"/data": volume},
+    gpu="H100",
+    timeout=7200,
+    # cpu=8.0,
+    # memory=32768,  # 32GB RAM
 )
 def train_worker(rank: int, world_size: int, master_addr: str, master_port: str, args: dict):
     """Worker function for distributed training on Modal"""
@@ -219,41 +273,44 @@ def launch_distributed_training(world_size: int = 4, **training_args):
     }
 
 @app.local_entrypoint()
-def main(
-    world_size: int = 4,
-    batch_size: int = 32,
-    epochs: int = 10,
-    lr: float = 2e-4,
-    weight_decay: float = 1e-4,
-    use_modal: bool = True,
-    num_sequences: int = 50000,
-    save_every: int = 5,
-):
-    """Local entrypoint to launch distributed training on Modal"""
+def main():
+    examine_model.remote()
     
-    training_args = {
-        "batch_size": batch_size,
-        "lr": lr,
-        "epochs": epochs,
-        "weight_decay": weight_decay,
-        "use_modal": use_modal,
-        "modal_data_dir": "/data",
-        "num_sequences": num_sequences,
-        "save_every": save_every,
-    }
+# def main(
+#     world_size: int = 4,
+#     batch_size: int = 32,
+#     epochs: int = 10,
+#     lr: float = 2e-4,
+#     weight_decay: float = 1e-4,
+#     use_modal: bool = True,
+#     num_sequences: int = 50000,
+#     save_every: int = 5,
+# ):
+#     """Local entrypoint to launch distributed training on Modal"""
     
-    print("Starting distributed training on Modal...")
-    print(f"Configuration: {training_args}")
+#     training_args = {
+#         "batch_size": batch_size,
+#         "lr": lr,
+#         "epochs": epochs,
+#         "weight_decay": weight_decay,
+#         "use_modal": use_modal,
+#         "modal_data_dir": "/data",
+#         "num_sequences": num_sequences,
+#         "save_every": save_every,
+#     }
     
-    result = launch_distributed_training.remote(
-        world_size=world_size,
-        **training_args
-    )
+#     print("Starting distributed training on Modal...")
+#     print(f"Configuration: {training_args}")
     
-    print("Training completed!")
-    print(f"Results: {result}")
+#     result = launch_distributed_training.remote(
+#         world_size=world_size,
+#         **training_args
+#     )
+    
+#     print("Training completed!")
+#     print(f"Results: {result}")
 
-if __name__ == "__main__":
-    print("This script is designed to run on Modal.")
-    print("To run locally, use: modal run src/train_ddp.py")
-    print("Or with custom parameters: modal run src/train_ddp.py --world-size 2 --epochs 5")
+# if __name__ == "__main__":
+#     print("This script is designed to run on Modal.")
+#     print("To run locally, use: modal run src/train_ddp.py")
+#     print("Or with custom parameters: modal run src/train_ddp.py --world-size 2 --epochs 5")
