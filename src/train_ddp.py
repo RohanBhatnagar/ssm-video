@@ -9,7 +9,6 @@ from torchvision import transforms
 from tqdm import tqdm
 import modal
 
-# Modal App setup
 app = modal.App("video-frame-prediction-ddp")
 
 image = (
@@ -42,14 +41,14 @@ def examine_model():
     # in cuda env   
     import sys
     sys.path.append("/app")
-    from model import VideoFramePredictor, Encoder, TemporalMamba, Decoder
+    from model import VQVAEVideo, SpatialEncoder, SpatialDecoder, TemporalSSM, VectorQuantizerEMA
     from ptflops import get_model_complexity_info
     
     with torch.cuda.device(0):
-        encoder = Encoder().cuda()
+        encoder = SpatialEncoder().cuda()
         encoder_macs, encoder_params = get_model_complexity_info(
             encoder,
-            (7, 3, 64, 64),  # 7 frames 3 channels 64x64
+            (3, 64, 64),  # 1 img 3 channels 64x64
             as_strings=True,
             print_per_layer_stat=False,
             verbose=False,
@@ -57,10 +56,10 @@ def examine_model():
         print(f"Encoder FLOPS: {encoder_macs}")
         print(f"Encoder Params: {encoder_params}")
         
-        temporal = TemporalMamba(input_dim=16384, hidden_dim=1024, depth=4).cuda()
+        temporal = TemporalSSM(d_model=512, d_state=256, depth=4).cuda()
         mamba_macs, mamba_params = get_model_complexity_info(
             temporal,
-            (7, 16384),  # 7 timesteps 16384 latent dimension
+            (8, 512),  # (T, model dim)
             as_strings=True,
             print_per_layer_stat=False,
             verbose=False,
@@ -68,10 +67,15 @@ def examine_model():
         print(f"Mamba FLOPS: {mamba_macs}")
         print(f"Mamba Params: {mamba_params}")
         
-        decoder = Decoder(latent_dim=16384, output_channels=3).cuda()
+        decoder = SpatialDecoder(
+            in_ch=256, 
+            base_ch=64, 
+            num_blocks=4, 
+            out_ch=3
+        ).cuda()
         decoder_macs, decoder_params = get_model_complexity_info(
             decoder,
-            (16384,),  # single flattened latent vector
+            (256, 4, 4), # (D_emb, H', W')
             as_strings=True,
             print_per_layer_stat=False,
             verbose=False,
@@ -79,10 +83,22 @@ def examine_model():
         print(f"Decoder FLOPS: {decoder_macs}")
         print(f"Decoder Params: {decoder_params}")
         
-        model = VideoFramePredictor().cuda()
+        quantizer = VectorQuantizerEMA(K=512, D=256).cuda()
+        quantizer_macs, quantizer_params = get_model_complexity_info(
+            quantizer,
+            (1, 256), # input: posterior, (N, D) flattened (B*T*H'*W', D), just use 1 for a compelxity of a single vector
+            as_strings=True,
+            print_per_layer_stat=False,
+            verbose=False,
+        )
+        print(f"Quantizer FLOPS: {quantizer_macs}")
+        print(f"Quantizer Params: {quantizer_params}")
+        
+        # total model 
+        model = VQVAEVideo().cuda()
         total_macs, total_params = get_model_complexity_info(
             model,
-            (7, 3, 64, 64),  # 7 frames, 3 channels, 64x64
+            (8, 3, 64, 64),  # B, T, C, H, W
             as_strings=True,
             print_per_layer_stat=False,
             verbose=False,
