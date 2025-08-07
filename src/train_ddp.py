@@ -12,31 +12,29 @@ import modal
 
 app = modal.App("video-frame-prediction-ddp")
 
-# Build the Docker image: include model.py and the datasets package
 image = (
     modal.Image
-         .from_registry("pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel")
-         .pip_install([
-             "torch==2.7.1",
-             "torchvision==0.22.1",
-             "tqdm==4.67.1",
-             "numpy==2.2.6",
-             "matplotlib==3.10.3",
-             "pillow==11.3.0",
-             "ptflops==0.7.4",
-             "mamba-ssm",
-         ])
-         .run_commands("mkdir -p /app/datasets")
-         .add_local_file("model.py", remote_path="/app/model.py")
-         .add_local_file(
-             "datasets/dataloader.py",
-             remote_path="/app/datasets/dataloader.py"
-         )
+        .from_registry("pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel")
+        .pip_install([
+            "torch==2.7.1",
+            "torchvision==0.22.1",
+            "tqdm==4.67.1",
+            "numpy==2.2.6",
+            "matplotlib==3.10.3",
+            "pillow==11.3.0",
+            "h5py==3.11.0",
+            "ptflops==0.7.4",
+        ])
+        .run_commands("mkdir -p /tmp/data")
+        .add_local_file("model.py", remote_path="/app/model.py")
+        .add_local_file(
+            "datasets/dataloader.py",
+            remote_path="/app/datasets/dataloader.py"
+        )
 )
 
 volume = modal.Volume.from_name("ssm-video", create_if_missing=True)
 
-# Top-level worker function must be picklable for spawn
 def ddp_worker(
     rank: int,
     world_size: int,
@@ -90,7 +88,7 @@ def ddp_worker(
     if rank == 0:
         print(f"Starting training on {world_size} GPUs")
         print(f"Batch size per GPU: {batch_size} (total {batch_size * world_size})")
-        print(f"Epochs: {epochs}, LR: {lr}, WD: {weight_decay}")
+        print(f"Epochs: {epochs}, LR: {lr}, Weight Decay: {weight_decay}")
 
     for epoch in range(epochs):
         sampler.set_epoch(epoch)
@@ -169,10 +167,10 @@ def train_worker(
 @app.local_entrypoint()
 def main(
     batch_size: int = 32,
-    epochs: int = 10,
+    epochs: int = 3,
     lr: float = 2e-4,
     weight_decay: float = 1e-4,
-    save_every: int = 10,
+    save_every: int = 1,
     train: bool = False,
     ptflops: bool = False,
 ):
@@ -193,8 +191,8 @@ def main(
             data_paths=data_paths,
         )
         print("Training started—waiting for it to finish...")
-        result = call.get()
-        print("Training completed! Result:", result)
+        call.get()
+        print("Training completed!")
     elif ptflops: 
         examine_model.remote()
         get_data_paths.remote()
@@ -203,7 +201,6 @@ def main(
 @app.function(
     image=image,
     volumes={"/data": volume},
-    gpu="A100",
     timeout=7200,
 )
 def examine_model():   
@@ -240,7 +237,7 @@ def examine_model():
         print(f"Decoder FLOPS: {decoder_macs}")
         print(f"Decoder Params: {decoder_params}")
         
-        quantizer = VectorQuantizerEMA(K=512, D=256).cuda()
+        quantizer = VectorQuantizerEMA(K=256, D=256).cuda()
         quantizer_macs, quantizer_params = get_model_complexity_info(
             quantizer,
             (1, 256), # input: posterior, (N, D) flattened (B*T*H'*W', D), just use 1 for a compelxity of a single vector
@@ -270,5 +267,5 @@ def examine_model():
 )
 def get_data_paths():
     import glob
-    data_paths = glob.glob("/data/batch_*.pt")
-    return data_paths
+    h5_paths = glob.glob("/data/batch_*.h5")
+    return sorted(h5_paths)

@@ -1,7 +1,6 @@
 import torch.nn as nn 
 import torch 
 import torch.nn.functional as F
-from mamba_ssm import Mamba
 
 class VQVAEVideo(nn.Module):
     def __init__(self,
@@ -56,37 +55,6 @@ class SpatialEncoder(nn.Module):
         self.net = nn.Sequential(*layers)
     def forward(self, x):  # x: (B,3,H,W)
         return self.net(x)
-
-class TemporalSSM(nn.Module):
-    def __init__(self, 
-                 d_model: int, 
-                 d_state: int, 
-                 depth: int = 4,
-                 d_conv: int = 4,
-                 expand: int = 2):
-        """
-        d_model: latent dim
-        d_state: hidden dim
-        depth: num blocks  
-        d_conv: conv kernel size
-        expand: expansion factor
-        """
-        super().__init__()
-        layers = []
-        for _ in range(depth):
-            layers.append(
-                Mamba(
-                    d_model = d_model,
-                    d_state = d_state,
-                    d_conv  = d_conv,
-                    expand  = expand,
-                )
-            )
-        self.ssm = nn.Sequential(*layers)
-
-    def forward(self, x):
-        # x: (B, T, d_model)
-        return self.ssm(x)
 
 class VectorQuantizerEMA(nn.Module):
     """
@@ -149,5 +117,37 @@ class SpatialDecoder(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
-        # x: (B·T, in_ch, H′, W′)
         return self.net(x)
+
+# class TemporalSSM(nn.Module):
+#     from mamba_ssm import Mamba
+
+#     def __init__(self, 
+#                  d_model: int, 
+#                  d_state: int, 
+#                  depth: int = 4,
+#                  d_conv: int = 4,
+#                  expand: int = 2):
+#         """
+#         d_model: latent dim
+#         d_state: hidden dim
+#         depth: num blocks  
+#         d_conv: conv kernel size
+#         expand: expansion factor
+#         """
+#         super().__init__()
+#         layers = []
+#         for _ in range(depth):
+#             layers.append(
+#                 Mamba(
+#                     d_model = d_model,
+#                     d_state = d_state,
+#                     d_conv  = d_conv,
+#                     expand  = expand,
+#                 )
+#             )
+#         self.ssm = nn.Sequential(*layers)
+
+#     def forward(self, x):
+#         # x: (B, T, d_model)
+#         return self.ssm(x)
