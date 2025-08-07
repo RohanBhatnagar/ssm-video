@@ -1,63 +1,85 @@
-# Video prediction with state-space-models
+# Next-frame prediction with VQ-VAE and SSMs
 
-Next-2-frame prediction model using **State Space Models (Mamba)** for efficient temporal modeling with **linear complexity** in sequence length.
+The goal of this project is to generate future frames given a prior. To do this, we first train a Vector quantized variational autoencoder (VQ-VAE), then a state space model (SSM) to predict the next frame (autoregressively) given an ancestral prior. 
 
+## Stage 1 · VQ-VAE
 
-## 🏗️ Architecture
-
-The model follows an **Encoder-Temporal-Decoder** architecture:
+The first stage is a **Vector-Quantized Variational Auto-Encoder** that acts purely on
+spatial information (per-frame).  It compresses each RGB frame into a compact grid of
+discrete tokens that the temporal model will later use.
 
 ```
-Input: [B, T, 3, 64, 64] → Output: [B, num_next_frames, 3, 64, 64]
+Input frame  (3 × 64 × 64)
+    │
+    ▼
+Encoder (CNN) ──► Continuous latents ──► Vector-Quantiser ──► Discrete codes ──► Decoder (CNN) ──► Reconstruction
 ```
 
-### Components:
+### Components
 
-1. **Encoder (ResNet-style)**
-   - Processes each frame independently
-   - Extracts spatial features: `(T, 3, 64, 64) → (T, 16384)`
-   - ResNet blocks with downsampling
+1. **Spatial Encoder (3 D-ResNet-style)**
+   • Processes each frame independently.  
+   • Downsamples via strided convolutions: `(3, 64, 64) → Cₑ × H′ × W′`.
 
-2. **TemporalMamba (SSM)**
-   - Models temporal dependencies across context window
-   - Selective state space model: `(T, 16384) → (num_next_frames,16384)`
-   - 4-layers with `hidden_dim=1024`
+2. **EMA Vector-Quantiser**
+   • Maps each latent vector to the nearest entry in a learnable *codebook* of size K.  
+   • Uses exponential-moving-average updates for stable training.  
+   • Outputs discrete indices and a *commitment* loss.
 
-3. **Decoder (ConvTranspose)**
-   - Reconstructs next frame from latent representation
-   - Upsampling with skip connections: `(16384) → (3, 64, 64)`
-   - Nearest-neighbor upsampling for sharp details
+3. **Spatial Decoder (ConvTranspose)**
+   • Upsamples the quantised feature map back to `(3, 64, 64)`.  
+   • Mirror of the encoder with transposed convs + batch-norm + LeakyReLU.
+
+> **Note** The *Temporal Mamba SSM* that models dynamics is trained in **Stage 2** and is
+> therefore documented in the *Training Pipeline* section below, not here.
 
 ## Model Specs
 
-Architecture is prone to change but between 200 and 700 M params, and 4.6 GMacs.
+Architecture is changing. Encoder/decoder are very simple right now, doing downsampling and reconstruction with only 2d convolutions. The current model is about 25M params.
 
 ## Dataset
 
-Initial training on Moving MNIST. Essentially MNIST digits randomly selected and placed on a 64x64 black canvas, and set in motion given `initial_pos` and `velocity`
+Initial training on Moving MNIST. Essentially, MNIST digits randomly selected and placed on a 64x64 black canvas, and set in motion given `initial_pos` and `velocity`
 
-https://www.cs.toronto.edu/~nitish/unsupervised_video/
+See more here: https://www.cs.toronto.edu/~nitish/unsupervised_video/
 
+## Training Pipeline (2-Stage)
 
-## Training
-
-### Distributed Data Parallel (DDP) on Modal
-- **Multi-GPU**: H100/A100 distributed training with DDP
-- **Mixed Precision**: FP16 + GradScaler for efficiency  
-- **Learning Rate**: Cosine annealing schedule
-- **Optimizer**: AdamW with weight decay
-- **Loss**: L1 loss for sharp reconstruction
-
-### Training Configuration
-```python
-training_args = {
-    "batch_size": 16,          # Per-GPU batch size
-    "lr": 2e-4,               # Learning rate
-    "epochs": 10,             # Training epochs
-    "weight_decay": 1e-4,     # AdamW weight decay
-    "save_every": 5,          # Checkpoint frequency
-}
 ```
+raw frames ──► Stage 1: VQ-VAE ──► discrete tokens ──► Stage 2: SSM prior ──► next-frame tokens ──► VQ-VAE decoder ──► next frame
+```
+
+All training is done on 4 A100 GPUs using PyTorch's Distributed Data Parallel (DDP).
+
+### Stage 1 · Vector-Quantised VAE
+
+1. **Goal** – Learn a spatial compressor that maps each 64 × 64 RGB frame to a compact grid of *discrete* latent codes.
+2. **Loss** – L1 reconstruction + β·commitment (β = 0.25).
+3. **Code** – `src/model.py` implements an encoder → EMA vector-quantiser → decoder.  Training is launched via `src/train_ddp.py` which runs **Distributed Data Parallel** jobs on Modal GPUs.
+
+> ℹ️ Why VQ-VAE?  Discrete latents drastically reduce the sequence length for the temporal model and remove colour/texture ambiguity, letting the second stage focus purely on dynamics.
+
+### Stage 2 · Autoregressive State-Space Prior (Mamba)
+
+1. **Preparation** – Freeze the trained VQ-VAE.  Encode every frame in the dataset to obtain sequences of codebook indices.
+2. **Model** – A *Mamba* State-Space Model is trained to predict the next token given a context window.  Because Mamba mixes states in **linear time**, it scales well to long video sequences.
+3. **Sampling** – At inference we sample tokens autoregressively (ancestral sampling) and decode them back to RGB frames with the VQ-VAE decoder.
+
+> ℹ️ Compared with Transformers this SSM prior has ϴ(L) memory/computation and excels at very long horizons. While the current prior will not be very long, I hope to achieve similar performance to architectures that use transformers. 
+
+### Modal Training Configuration
+
+```python
+train_cfg = dict(
+    batch_size = 32,    # per-GPU
+    lr         = 2e-4,
+    epochs     = 10,
+    weight_decay = 1e-4,
+    save_every = 5,
+)
+```
+
+Additional flags (`--train`, `--ptflops`) can be passed to `src/train_ddp.py` for launching distributed runs or measuring FLOPs/params.
 
 ## Project Structure
 
