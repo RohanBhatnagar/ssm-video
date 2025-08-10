@@ -26,7 +26,9 @@ image = (
             "ptflops==0.7.4",
         ])
         .run_commands("mkdir -p /tmp/data")
-        .add_local_file("model.py", remote_path="/app/model.py")
+        .add_local_file("models/model.py", remote_path="/app/models/model.py")
+        .add_local_file("models/originals.py", remote_path="/app/models/originals.py")
+        .add_local_file("models/vqvae3d.py", remote_path="/app/models/vqvae3d.py")
         .add_local_file(
             "datasets/dataloader.py",
             remote_path="/app/datasets/dataloader.py"
@@ -47,7 +49,9 @@ def ddp_worker(
 ):
     import sys
     sys.path.append("/app")
-    from model import VQVAEVideo
+    # from models.model import VQVAEVideo
+    # from models.originals import VQVAEVideo
+    from models.vqvae3d import VQVAEVideo
     from datasets.dataloader import MovingMNIST
     
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -80,7 +84,6 @@ def ddp_worker(
         model.parameters(), lr=lr, weight_decay=weight_decay
     )
     scaler = torch.amp.GradScaler("cuda")
-    loss_fn = nn.L1Loss()
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs
     )
@@ -97,7 +100,7 @@ def ddp_worker(
             frames = frames.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            with torch.amp.autocast("cuda"):
+            with torch.amp.autocast("cuda", enabled=False):
                 reconstruction, _, _, total_loss = model.module(frames)
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
@@ -132,7 +135,7 @@ def ddp_worker(
 @app.function(
     image=image,
     volumes={"/data": volume},
-    gpu="A100:4",
+    gpu="A100:8",
     memory=32 * 1024,
     timeout=8 * 3600,
 )
@@ -169,7 +172,7 @@ def main(
     batch_size: int = 32,
     epochs: int = 3,
     lr: float = 2e-4,
-    weight_decay: float = 1e-4,
+    weight_decay: float = 0, # 1e-4, no need for 3 epochs
     save_every: int = 1,
     train: bool = False,
     ptflops: bool = False,
@@ -201,19 +204,22 @@ def main(
 @app.function(
     image=image,
     volumes={"/data": volume},
+    gpu="A100",
     timeout=7200,
 )
 def examine_model():   
     import sys
     sys.path.append("/app")
-    from model import VQVAEVideo, SpatialEncoder, SpatialDecoder, VectorQuantizerEMA
+    # from models.model import VQVAEVideo, SpatialEncoder, SpatialDecoder, VectorQuantizerEMA
+    # from models.originals import VQVAEVideo, SpatialEncoder, SpatialDecoder, VectorQuantizerEMA
+    from models.vqvae3d import VQVAEVideo, Decoder, Encoder, VectorQuantizerEMA
     from ptflops import get_model_complexity_info
     
     with torch.cuda.device(0):
-        encoder = SpatialEncoder().cuda()
+        encoder = Encoder().cuda() 
         encoder_macs, encoder_params = get_model_complexity_info(
             encoder,
-            (3, 64, 64), 
+            (1, 16, 64, 64),
             as_strings=True,
             print_per_layer_stat=False,
             verbose=False,
@@ -221,15 +227,10 @@ def examine_model():
         print(f"Encoder FLOPS: {encoder_macs}")
         print(f"Encoder Params: {encoder_params}")
         
-        decoder = SpatialDecoder(
-            in_ch=256, 
-            base_ch=64, 
-            num_blocks=4, 
-            out_ch=3
-        ).cuda()
+        decoder = Decoder().cuda()
         decoder_macs, decoder_params = get_model_complexity_info(
             decoder,
-            (256, 4, 4), # (D_emb, H', W')
+            (64, 4, 16, 16),
             as_strings=True,
             print_per_layer_stat=False,
             verbose=False,
@@ -237,10 +238,10 @@ def examine_model():
         print(f"Decoder FLOPS: {decoder_macs}")
         print(f"Decoder Params: {decoder_params}")
         
-        quantizer = VectorQuantizerEMA(K=256, D=256).cuda()
+        quantizer = VectorQuantizerEMA().cuda()
         quantizer_macs, quantizer_params = get_model_complexity_info(
             quantizer,
-            (1, 256), # input: posterior, (N, D) flattened (B*T*H'*W', D), just use 1 for a compelxity of a single vector
+            (1, 64),
             as_strings=True,
             print_per_layer_stat=False,
             verbose=False,
@@ -248,11 +249,10 @@ def examine_model():
         print(f"Quantizer FLOPS: {quantizer_macs}")
         print(f"Quantizer Params: {quantizer_params}")
         
-        # total model 
         model = VQVAEVideo().cuda()
         total_macs, total_params = get_model_complexity_info(
             model,
-            (8, 3, 64, 64),  # B, T, C, H, W
+            (1, 16, 64, 64),  # B, C, T, H, W
             as_strings=True,
             print_per_layer_stat=False,
             verbose=False,
