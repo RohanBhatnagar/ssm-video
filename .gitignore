@@ -44,7 +44,6 @@ venv.bak/
 *.hdf5
 
 # Model Downloads & Caches
-models/
 checkpoints/
 cache/
 .cache/
@@ -108,7 +107,6 @@ Thumbs.db
 
 # Large Files & Datasets
 data/
-datasets/
 *.csv
 *.json.gz
 *.tar.gz

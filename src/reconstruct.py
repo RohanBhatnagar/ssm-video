@@ -17,9 +17,7 @@ image = (
             "matplotlib==3.10.3",
         ])
         .run_commands("mkdir -p /app /data")
-        .add_local_file("models/model.py", remote_path="/app/model.py")
         .add_local_file("models/originals.py", remote_path="/app/models/originals.py")
-        .add_local_file("models/vqvae3d.py", remote_path="/app/models/vqvae3d.py")
 )
 
 
@@ -31,7 +29,7 @@ def _generate_moving_mnist_batch(
 ) -> torch.Tensor:
     """Generate a batch of MovingMNIST sequences in-memory.
 
-    Returns a float tensor in [0, 1] with shape (B, 1, T, H, W) for VQVAE3D model.
+    Returns a float tensor in [0, 1] with shape (B, T, 3, H, W) for RGB models.
     """
     import random
     import torch
@@ -40,7 +38,6 @@ def _generate_moving_mnist_batch(
 
     mnist = MNIST(root="/tmp/mnist", train=True, download=True, transform=transforms.ToTensor())
 
-    # Preload all digit images as 28x28 single-channel tensors
     digit_cache = []
     for i in range(len(mnist)):
         digit_img, _ = mnist[i]
@@ -61,7 +58,6 @@ def _generate_moving_mnist_batch(
                 top, left = pos
                 canvas[t, 0, top:top + 28, left:left + 28] += digit_img
 
-                # Bounce update
                 for k in range(2):
                     pos[k] += vel[k]
                     if pos[k] <= 0 or pos[k] + 28 >= image_size:
@@ -69,11 +65,11 @@ def _generate_moving_mnist_batch(
                         pos[k] += vel[k]
 
         canvas = torch.clamp(canvas, 0, 1)
-        # Rearrange from (T, 1, H, W) to (1, T, H, W) for VQVAE3D
-        frames_grayscale = canvas.permute(1, 0, 2, 3)  # [1, T, H, W]
-        all_frames.append(frames_grayscale)
+        
+        canvas_rgb = canvas.repeat(1, 3, 1, 1)  # [T, 3, H, W]
+        all_frames.append(canvas_rgb)
 
-    frames_tensor = torch.stack(all_frames)  # [B, 1, T, H, W]
+    frames_tensor = torch.stack(all_frames)  # [B, T, 3, H, W]
     return frames_tensor
 
 
@@ -84,11 +80,21 @@ def _save_side_by_side_grid(
 ) -> None:
     """Save a 2xT grid comparing originals (top row) and reconstructions (bottom row).
 
-    originals, reconstructions: tensors in [0, 1] with shape (1, T, H, W).
+    originals, reconstructions: tensors in [0, 1] with shape (T, 3, H, W).
     """
-    # Convert from (1, T, H, W) to (T, H, W) and then to numpy
-    originals = originals.squeeze(0).detach().cpu().numpy()  # (T, H, W)
-    reconstructions = reconstructions.squeeze(0).detach().cpu().numpy()  # (T, H, W)
+    # Convert RGB to grayscale for visualization: take first channel or convert properly
+    if originals.shape[1] == 3:  # (T, 3, H, W)
+        originals = originals[:, 0]  # Take red channel for visualization (T, H, W)
+    else:
+        originals = originals.squeeze(1)  # (T, H, W)
+        
+    if reconstructions.shape[1] == 3:  # (T, 3, H, W)
+        reconstructions = reconstructions[:, 0]  # Take red channel for visualization (T, H, W)
+    else:
+        reconstructions = reconstructions.squeeze(1)  # (T, H, W)
+
+    originals = originals.detach().cpu().numpy()  # (T, H, W)
+    reconstructions = reconstructions.detach().cpu().numpy()  # (T, H, W)
 
     T = originals.shape[0]
     fig, axes = plt.subplots(2, T, figsize=(2 * T, 4))
@@ -100,12 +106,12 @@ def _save_side_by_side_grid(
         img_o = originals[t]  # (H, W)
         img_r = reconstructions[t]  # (H, W)
 
-        ax_top.imshow(img_o, cmap='gray')
+        ax_top.imshow(img_o, cmap='gray', vmin=0, vmax=1)
         ax_top.axis("off")
         if t == 0:
             ax_top.set_title("Original")
 
-        ax_bot.imshow(img_r, cmap='gray')
+        ax_bot.imshow(img_r, cmap='gray', vmin=0, vmax=1)
         ax_bot.axis("off")
         if t == 0:
             ax_bot.set_title("Reconstruction")
@@ -130,7 +136,7 @@ def reconstruct(
     import sys
     sys.path.append("/app")
     import torch
-    from models.vqvae3d import VQVAEVideo
+    from models.originals import VQVAEVideo, VQVAEConfig
 
     device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -139,7 +145,7 @@ def reconstruct(
     frames = frames.to(device)
 
     # Load model
-    model = VQVAEVideo().to(device)
+    model = VQVAEVideo(VQVAEConfig()).to(device)
     model.eval()
 
     # Load weights (support both raw state_dict and full checkpoint dict)
@@ -154,11 +160,9 @@ def reconstruct(
     except FileNotFoundError:
         print(f"Checkpoint not found at {checkpoint_path}. Using randomly initialised weights.")
 
-    # Reconstruct
     with torch.no_grad():
         recon, _, _, _ = model(frames)
 
-    # Save side-by-side comparisons for each sequence
     saved_paths = []
     for i in range(batch_size):
         save_path = f"/data/reconstruction_{i}.png"
@@ -173,7 +177,7 @@ def reconstruct(
 def main(
     checkpoint_path: str = "/data/final_model.pt",
     batch_size: int = 1,
-    seq_len: int = 16,  # Changed to 16 to match VQVAE3D expectations
+    seq_len: int = 16,
     mnist_digits: int = 2,
 ):
     print("Launching reconstruction job on Modal…")
